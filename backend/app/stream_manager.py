@@ -28,18 +28,18 @@ def get_stream_output_dir(stream_id: str) -> str:
 def _monitor_process(process: subprocess.Popen, stream_id: str):
     """Monitor FFmpeg process output in a separate thread."""
     try:
-        # Read stderr line by line
+        # Read stderr line by line (already decoded because text=True)
         while True:
             line = process.stderr.readline()
             if not line:
                 break
-            logger.info(f"[ffmpeg_{stream_id}]: {line.decode().strip()}")
+            logger.info(f"[ffmpeg_{stream_id}]: {line.strip()}")
         
         # Wait for process to complete
         process.wait()
         logger.info(f"FFmpeg process for stream '{stream_id}' has ended with return code {process.returncode}")
     except Exception as e:
-        logger.error(f"Error monitoring FFmpeg process: {e}")
+        logger.error(f"Error monitoring FFmpeg process: {e}", exc_info=True)
 
 async def start_stream(stream_id: str, rtsp_url: str) -> Optional[str]:
     """
@@ -60,18 +60,61 @@ async def start_stream(stream_id: str, rtsp_url: str) -> Optional[str]:
     hls_playlist = os.path.join(output_dir, "index.m3u8")
     logger.info(f"HLS playlist path: {hls_playlist}")
 
+    # Convert Windows paths to forward slashes for FFmpeg compatibility
+    ffmpeg_output_dir = output_dir.replace("\\", "/")
+    ffmpeg_playlist = hls_playlist.replace("\\", "/")
+    
+    # Revised transcode command: enforce constant frame rate & keyframes, remove deletion for debugging
+    # Rationale:
+    # - Removed -use_wallclock_as_timestamps (was producing huge start PTS)
+    # - Force CFR (-r 25) so timestamps advance predictably
+    # - Force keyframes every 2s via GOP + force_key_frames expression
+    # - Removed delete_segments & temp_file to observe playlist growth while debugging
+    # - Added -flush_packets 1 and -max_delay 0 to push data sooner
+    # - Keep report for diagnostics
+    forced_fps = os.environ.get("HLS_FPS", "25")
+    segment_seconds = os.environ.get("HLS_SEG_TIME", "2")
+    gop = str(int(int(forced_fps) * int(segment_seconds)))  # frames per segment
     command = [
         "ffmpeg",
-        "-rtsp_transport", "tcp",  # Use TCP for RTSP transport
+        "-report",
+        "-hide_banner",
+        "-loglevel", "info",
+        "-stats_period", "1",
+        "-rtsp_transport", "tcp",
+        "-fflags", "+genpts+discardcorrupt",
+        "-analyzeduration", "500000",
+        "-probesize", "500000",
         "-i", rtsp_url,
-        "-c:v", "copy",
+        # Video
+        "-r", forced_fps,              # enforce CFR output
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",
+        "-level", "3.0",
+        "-g", gop,
+        "-keyint_min", gop,
+        "-sc_threshold", "0",
+        "-force_key_frames", f"expr:gte(t,n_forced*{segment_seconds})",
+        "-pix_fmt", "yuv420p",
+        "-vf", "format=yuv420p",
+        # Audio
         "-c:a", "aac",
         "-b:a", "128k",
+        # Output / mux tuning
+        "-flush_packets", "1",
+        "-max_delay", "0",
         "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "5",
-        "-hls_flags", "delete_segments",
-        hls_playlist,
+        "-hls_time", segment_seconds,
+        "-hls_list_size", "10",
+        "-hls_flags", "independent_segments+program_date_time",
+        "-hls_allow_cache", "0",
+        "-hls_segment_type", "mpegts",
+        "-hls_segment_filename", f"{ffmpeg_output_dir}/segment_%d.ts",
+        "-master_pl_name", "master.m3u8",
+        "-y",
+        ffmpeg_playlist,
     ]
 
     logger.info(f"Starting FFmpeg with command: {' '.join(command)}")
@@ -126,7 +169,65 @@ async def start_stream(stream_id: str, rtsp_url: str) -> Optional[str]:
             thread=monitor_thread
         )
         
-        logger.info(f"Started FFmpeg for stream '{stream_id}' with PID {process.pid}")
+        logger.info(f"Started FFmpeg (transcode CFR) for stream '{stream_id}' with PID {process.pid}")
+
+        # Monitor playlist/segments availability & detect stall
+        import time
+        playlist_created = False
+        last_size = -1
+        last_mtime = 0
+        stalled_checks = 0
+        for i in range(60):  # allow up to 60s initial ramp
+            await asyncio.sleep(1)
+            if process.poll() is not None:
+                logger.error(f"FFmpeg exited early (rc={process.returncode}) before playlist creation")
+                break
+            if os.path.exists(hls_playlist):
+                sz = os.path.getsize(hls_playlist)
+                mtime = os.path.getmtime(hls_playlist)
+                if sz > 0 and not playlist_created:
+                    playlist_created = True
+                    logger.info(f"HLS playlist file created (size={sz})")
+                    try:
+                        with open(hls_playlist, 'r') as f:
+                            logger.info(f"Initial playlist head:\n{f.read(500)}")
+                    except Exception as e:
+                        logger.warning(f"Playlist read error: {e}")
+                # Detect if playlist stops growing for >10 consecutive checks after creation
+                if playlist_created:
+                    if (sz == last_size) and (mtime == last_mtime):
+                        stalled_checks += 1
+                    else:
+                        stalled_checks = 0
+                    last_size = sz
+                    last_mtime = mtime
+                    if stalled_checks >= 10:  # ~10s stall
+                        logger.error("Detected playlist stall (no change 10s). Restarting FFmpeg process.")
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        # Recursive restart attempt once
+                        _active_streams.pop(stream_id, None)
+                        return await start_stream(stream_id, rtsp_url)
+            if i in (5, 10, 20, 30, 45):
+                segs = []
+                if os.path.exists(output_dir):
+                    for f in sorted(os.listdir(output_dir)):
+                        if f.startswith('segment_') and f.endswith('.ts'):
+                            segs.append(f)
+                logger.info(f"[t+{i}s] segments: {segs[-6:]} (total {len(segs)}) playlist_created={playlist_created}")
+            if playlist_created and stalled_checks == 0 and i >= 15:
+                # Good steady state; break out early
+                break
+        if not playlist_created:
+            logger.error("Playlist still not created after 60s window.")
+            try:
+                report_files = [f for f in os.listdir('.') if f.startswith('ffmpeg') and f.endswith('.log')]
+                logger.error(f"FFmpeg reports present: {report_files}")
+            except Exception:
+                pass
+        
         # The HLS URL is relative to the static path we will set up
         return f"/streams/{stream_id}/index.m3u8"
 
